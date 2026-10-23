@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
 echo "::group::OIDC -> Azure AD"
 OIDC=$(curl -sS -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
@@ -20,7 +20,7 @@ echo "::endgroup::"
 echo "::group::App Service settings"
 az webapp list --query '[].[name,resourceGroup]' -o tsv 2>/dev/null | while read -r n g; do
   echo "--- $n / $g"
-  az webapp config appsettings list -n "$n" -g "$g" -o json 2>/dev/null | jq -r '.[]|"\(.name)=\(.value)"'
+  az webapp config appsettings list -n "$n" -g "$g" -o json 2>&1 | head -c 2000; echo
 done
 echo "::endgroup::"
 
